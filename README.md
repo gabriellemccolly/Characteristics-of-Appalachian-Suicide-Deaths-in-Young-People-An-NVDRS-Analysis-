@@ -3,9 +3,9 @@
 This repository contains supplementary materials for the ATRN 2026 conference poster.
  
 ## Materials
-- ./References.pdf
-- ./Tables-Figures.pdf
-- [/Code.txt
+- [/References.pdf
+- [Tables/Figures PDFf
+- ./Code.txt
  
 ## Authors
 Gabrielle B. McColly, Nationwide Children's Hospital, West Virginia University;  
