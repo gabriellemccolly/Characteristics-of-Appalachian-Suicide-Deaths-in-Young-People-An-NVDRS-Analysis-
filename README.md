@@ -5,7 +5,7 @@ This repository contains supplementary materials for the ATRN 2026 conference po
 ## Materials
 - References PDF
 - Poster PDF
-- Figures
+- Tables/Figures
 - Analysis code
  
 ## Authors
