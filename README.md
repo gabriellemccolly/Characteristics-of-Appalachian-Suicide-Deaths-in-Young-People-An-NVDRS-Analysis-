@@ -1,4 +1,4 @@
-# Characteristics-of-Appalachian-Suicide-Deaths-in-Young-People-An-NVDRS-Analysis
+# Characteristics of Appalachian Suicide Deaths in Young People: An NVDRS Analysis
 ## Overview
 This repository contains supplementary materials for the ATRN 2026 conference poster.
  
@@ -9,7 +9,7 @@ This repository contains supplementary materials for the ATRN 2026 conference po
 - Analysis code
  
 ## Authors
-Gabrielle B. McColly, Nationwide Children's Hospital, West Virginia University;
+Gabrielle B. McColly, Nationwide Children's Hospital, West Virginia University;  
 Margaret V. Meyers, University of North Carolina at Chapel Hill;  
 Reagan M. Hicks, Nationwide Children’s Hospital;  
 Jonathan L. Doyle, UC Berkeley School of Public Health;  
