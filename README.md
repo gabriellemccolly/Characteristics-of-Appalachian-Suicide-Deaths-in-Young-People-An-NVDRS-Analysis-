@@ -20,3 +20,8 @@ Danielle L. Steelesmith, Nationwide Children’s Hospital, The Ohio State Univer
  
 ## Data Availability
 NVDRS data are not publicly available due to data use restrictions.
+
+## Acknowledgements
+Poster presentation utilized a template created by Marissa McClellan. The template is used under CC By 4.0 (Creative Commons) license.
+NVDRS data access was granted with assistance from Jeff Bridge. 
+This project was completed with guidance, support, and mentorship of Danielle Steelesmith. 
