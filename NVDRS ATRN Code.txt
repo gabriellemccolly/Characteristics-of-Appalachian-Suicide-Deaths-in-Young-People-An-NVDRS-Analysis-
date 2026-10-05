@@ -1,0 +1,1429 @@
+---
+title: "Appalachia project"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-07-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Create outputs folder up front so any chunk can write to it, even on a
+# fresh top-to-bottom knit.
+dir.create("outputs_main", showWarnings = FALSE)
+knitr::opts_knit$set(root.dir = "S:/RESCSPR_NVDRS/RISE Appalachia")
+```
+
+#Forest plot for LR viz
+#change missing data stuff?
+
+## Data import and merge
+
+```{r data-import-merge}
+setwd("S:/RESCSPR_NVDRS/RISE Appalachia")
+library(dplyr)
+library(stringr)
+library(readr)
+library(readxl)
+
+# Read files
+nvdrs    <- read_csv("S:/RESCSPR_NVDRS/RISE Appalachia/RISE_NVDRS_data.csv")
+svi      <- read_xlsx("C:/Users/GBM003/OneDrive - Nationwide Children's Hospital/SVI_2022_US_COUNTY (1).xlsx")
+app_raw  <- read_csv("C:/Users/GBM003/OneDrive - Nationwide Children's Hospital/App county codes.csv")
+rucc_raw <- read_xlsx("C:/Users/GBM003/OneDrive - Nationwide Children's Hospital/Ruralurbancontinuumcodes2023.xlsx")
+
+# Keep only needed SVI vars and standardize FIPS
+svi2 <- svi %>%
+  select(
+    STATE, COUNTY, FIPS,
+    RPL_THEME1, RPL_THEME2, RPL_THEME3, RPL_THEME4, RPL_THEMES
+  ) %>%
+  mutate(
+    FIPS = str_pad(str_trim(as.character(FIPS)), 5, "left", "0"),
+    across(
+      starts_with("RPL_THEME"),
+      ~ if_else(.x >= 0 & .x <= 1, .x, NA_real_)
+    )
+  ) %>%
+  distinct(FIPS, .keep_all = TRUE)
+
+# Clean NVDRS county FIPS
+nvdrs2 <- nvdrs %>%
+  mutate(
+    ResidenceFIPS = as.character(ResidenceFIPS),
+    ResidenceFIPS = str_trim(ResidenceFIPS),
+    ResidenceFIPS = na_if(ResidenceFIPS, ""),
+    ResidenceFIPS = if_else(!is.na(ResidenceFIPS) & nchar(ResidenceFIPS) > 5,
+                             str_sub(ResidenceFIPS, 1, 5), ResidenceFIPS),
+    ResidenceFIPS = if_else(!is.na(ResidenceFIPS),
+                             str_pad(ResidenceFIPS, 5, "left", "0"), NA_character_)
+  )
+
+# Build Appalachia flag
+app <- app_raw %>%
+  transmute(
+    FIPS = str_pad(as.character(`County Code (FIPS)`), 5, "left", "0"),
+    appalachia = 1L
+  ) %>%
+  distinct(FIPS, .keep_all = TRUE)
+
+head(app)
+
+# Add RUCC / rurality
+rucc_wide <- rucc_raw %>%
+  filter(Attribute == "RUCC_2023") %>%
+  transmute(
+    FIPS = str_pad(str_trim(FIPS), width = 5, side = "left", pad = "0"),
+    RUCC_2023 = as.integer(Value)
+  ) %>%
+  distinct(FIPS, .keep_all = TRUE)
+
+table(rucc_wide$RUCC_2023, useNA = "ifany")
+
+# Collapse to metro (1-3) vs nonmetro (4-9)
+rucc_wide <- rucc_wide %>%
+  mutate(
+    metro_f = case_when(
+      RUCC_2023 %in% 1:3 ~ "Metro",
+      RUCC_2023 %in% 4:9 ~ "Nonmetro",
+      TRUE ~ NA_character_
+),
+metro_f = factor(metro_f, levels = c("Metro", "Nonmetro"))
+  )
+
+# Merge everything
+analytic <- nvdrs2 %>%
+  left_join(svi2, by = c("ResidenceFIPS" = "FIPS")) %>%
+  left_join(app,  by = c("ResidenceFIPS" = "FIPS")) %>%
+  left_join(rucc_wide %>% select(FIPS, RUCC_2023, metro_f), by = c("ResidenceFIPS" = "FIPS")) %>%
+  mutate(
+    appalachia = case_when(
+    is.na(ResidenceFIPS) ~ NA_integer_,
+    appalachia == 1L ~ 1L,
+    TRUE ~ 0L
+  )
+)
+
+# QA
+nrow(nvdrs2) == nrow(analytic)
+table(analytic$appalachia, useNA = "ifany")
+mean(is.na(analytic$RPL_THEMES))
+mean(is.na(analytic$metro_f))
+table(analytic$metro_f, useNA = "ifany")
+head(analytic)
+summary(analytic)
+colnames(analytic)
+
+write_csv(analytic, "outputs_main/svi_nvdrs_merged.csv")
+```
+
+## Build analytic sample and derived variables
+
+```{r build-model-df}
+library(dplyr)
+library(forcats)
+
+model_df <- analytic %>%
+  filter(AgeYears_c >= 10, AgeYears_c <= 24) %>%
+  filter(!is.na(appalachia), !is.na(Sex), !is.na(IncidentYear), !is.na(RPL_THEMES)) %>%
+  mutate(
+    sex_f = factor(Sex, levels = c(2, 1), labels = c("Female", "Male")),  # confirm coding against NVDRS codebook
+    age_grp = case_when(
+      AgeYears_c >= 10 & AgeYears_c <= 14 ~ "10-14",
+      AgeYears_c >= 15 & AgeYears_c <= 17 ~ "15-17",
+      AgeYears_c >= 18 & AgeYears_c <= 24 ~ "18-24",
+      TRUE ~ NA_character_
+    ),
+    age_grp = factor(age_grp, levels = c("18-24", "15-17", "10-14")),
+
+    # FIX: previous version of this factor omitted "American Indian or Alaska
+    # Native" and "Native Hawaiian/Pacific Islander" from `levels`, which
+    # silently converted every decedent in those groups to NA everywhere
+    # downstream (tables, models). All 8 categories are now included.
+    #FIX FROM ABOVE: doing these analyeses; there is not Alaska Native or Pacific Islander, which is why it wouldnt caluclate. They are not excluded with the code below. Fix again: combining race/ethnicity 
+ race_eth_f = case_when(
+
+  Ethnicity == 1 ~ "Hispanic",
+
+  Ethnicity == 0 & Race_c == 1 ~ "Non-Hispanic White",
+  Ethnicity == 0 & Race_c == 2 ~ "Non-Hispanic Black",
+  Ethnicity == 0 & Race_c == 4 ~ "Non-Hispanic Asian",
+  Ethnicity == 0 & Race_c == 7 ~ "Non-Hispanic Two or More Races",
+
+  Ethnicity == 0 ~ "Other/Unknown",
+
+  Ethnicity == 9 ~ "Other/Unknown",
+
+  TRUE ~ "Other/Unknown"
+),
+
+year_f = factor(IncidentYear)
+)
+
+model_df <- model_df %>%
+  mutate(
+    race_eth_f = factor(
+      race_eth_f,
+      levels = c(
+        "Non-Hispanic White",
+        "Non-Hispanic Black",
+        "Non-Hispanic Asian",
+        "Non-Hispanic Two or More Races",
+        "Other/Unknown",
+        "Hispanic"
+      )
+    )
+  )
+
+# Suicide method category from ICD-10 underlying cause code
+model_df <- model_df %>%
+  mutate(
+    method_cat = case_when(
+      UnderlyingCauseCode %in% c("X72", "X73", "X74") ~ "Firearm",
+      UnderlyingCauseCode == "X70" ~ "Hanging/Suffocation",
+      UnderlyingCauseCode %in% c("X60","X61","X62","X63","X64","X65","X66","X67","X68","X69") ~ "Poisoning",
+      UnderlyingCauseCode %in% c("X71","X75","X76","X77","X78","X79","X80","X81","X82","X83","X84","Y87.0","U03") ~ "Other",
+      TRUE ~ NA_character_
+    ),
+    method_cat = factor(method_cat, levels = c("Other", "Firearm", "Hanging/Suffocation", "Poisoning"))
+  )
+
+# --- SVI variables ---
+# Two distinct derived SVI variables are used for two different purposes.
+# Using one shared name for both (as the earlier draft did) is what caused
+# `m_context` to reference an object that was never created — the
+# 4-category descriptive version and the 2-category regression version had
+# gotten conflated under the same name.
+
+# 1) svi_quartile_f: 4-category version, standard ATSDR/CDC cut points.
+#    Used for Table 1 descriptive statistics and the SVI-theme sensitivity
+#    model (m_themes) below.
+categorize_svi <- function(x) {
+  cut(
+    x,
+    breaks = c(-0.001, 0.25, 0.50, 0.75, 1.0),
+    labels = c("Low", "Low-Moderate", "Moderate-High", "High"),
+    right = TRUE
+  )
+}
+
+model_df <- model_df %>%
+  mutate(
+    svi_quartile_f  = categorize_svi(RPL_THEMES),
+    RPL_THEME1_cat  = categorize_svi(RPL_THEME1),
+    RPL_THEME2_cat  = categorize_svi(RPL_THEME2),
+    RPL_THEME3_cat  = categorize_svi(RPL_THEME3),
+    RPL_THEME4_cat  = categorize_svi(RPL_THEME4)
+  )
+
+lapply(
+  model_df[c("svi_quartile_f", "RPL_THEME1_cat", "RPL_THEME2_cat", "RPL_THEME3_cat", "RPL_THEME4_cat")],
+  table, useNA = "ifany"
+)
+
+# 2) svi_bin: 2-category Low vs High, dropping the middle band (0.25-0.75),
+#    per the "low vs. high SVI, like previous papers" approach for Table 3.
+#    This is a SEPARATE analytic sample (model_df3) from model_df, since
+#    records in the middle band are excluded from this model only.
+model_df3 <- model_df %>%
+  mutate(
+    svi_bin = case_when(
+      RPL_THEMES >= 0.75 ~ "High",
+      RPL_THEMES < 0.25  ~ "Low",
+      TRUE ~ NA_character_
+    ),
+    svi_bin = factor(svi_bin, levels = c("Low", "High"))
+  ) %>%
+  filter(!is.na(svi_bin))
+
+# How many records Table 3's dichotomization excludes relative to model_df
+# (worth reporting in methods/limitations, since Table 2 and Table 3 will
+# not share identical N's)
+nrow(model_df) - nrow(model_df3)
+table(model_df3$svi_bin, useNA = "ifany")
+
+
+# QA Check frequencies 
+vars_to_check <- c(
+  "appalachia",
+  "sex_f",
+  "age_grp",
+  "race_eth_f",
+  "year_f",
+  "method_cat",
+  "metro_f",
+  "svi_quartile_f",
+  "MentalHealthDiagnosis",
+  "has_depression",
+  "has_anyanxiety",
+  "has_bipolar",
+  "has_adhd",
+  "has_schizo",
+  "combinedotherdiagnosis",
+  "MentalIllnessTreatment",
+  "DepressedMood_c",
+  "SuicideThoughtHistory_c",
+  "SuicideAttemptHistory_c",
+  "InCrisis",
+  "RelationshipProblem",
+  "LegalProblem"
+)
+
+# FREQUENCY TABLES
+for(v in vars_to_check){
+
+  cat("\n\n========================================\n")
+  cat("VARIABLE:", v, "\n")
+  cat("========================================\n")
+
+  print(table(model_df[[v]], useNA = "ifany"))
+
+}
+
+# MISSINGNESS REPORT
+missing_report <- data.frame(
+  Variable = vars_to_check,
+  Missing_N = sapply(model_df[vars_to_check], function(x) sum(is.na(x))),
+  Missing_Pct = round(
+    100 * sapply(model_df[vars_to_check], function(x) mean(is.na(x))),
+    2
+  )
+)
+
+# COMPLETE CASE CHECK
+model_vars <- c(
+  "appalachia",
+  "sex_f",
+  "age_grp",
+  "race_eth_f",
+  "year_f",
+  "method_cat",
+  "metro_f",
+  "svi_quartile_f",
+  "MentalHealthDiagnosis",
+  "has_depression",
+  "has_anyanxiety",
+  "has_bipolar",
+  "has_adhd",
+  "has_schizo",
+  "combinedotherdiagnosis",
+  "MentalIllnessTreatment",
+  "DepressedMood_c",
+  "SuicideThoughtHistory_c",
+  "SuicideAttemptHistory_c",
+  "InCrisis",
+  "RelationshipProblem",
+  "LegalProblem"
+)
+
+cat("Total records:", nrow(model_df), "\n")
+
+cat(
+  "Complete records:",
+  sum(complete.cases(model_df[model_vars])),
+  "\n"
+)
+
+cat(
+  "Records with missing data:",
+  sum(!complete.cases(model_df[model_vars])),
+  "\n"
+)
+
+missing_report
+```
+
+## Table 1: Sample characteristics
+
+```{r}
+library(tibble)
+library(flextable)
+library(officer)
+
+# ============================================================
+# Sample counts
+# ============================================================
+
+n_app <- sum(model_df$appalachia == 1, na.rm = TRUE)
+n_non <- sum(model_df$appalachia == 0, na.rm = TRUE)
+n_total <- nrow(model_df)
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+fmt_bin_pct <- function(x) {
+  n <- sum(x == 1, na.rm = TRUE)
+  pct <- 100 * mean(x == 1, na.rm = TRUE)
+
+  sprintf("%s (%.1f%%)", format(n, big.mark = ","), pct)
+}
+
+fmt_p <- function(p) {
+  if (is.na(p)) return("")
+  if (p < .001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+make_bin_row <- function(label, var) {
+
+  overall <- model_df[[var]]
+
+  app <- model_df %>%
+    filter(appalachia == 1) %>%
+    pull(.data[[var]])
+
+  non <- model_df %>%
+    filter(appalachia == 0) %>%
+    pull(.data[[var]])
+
+  pval <- suppressWarnings(
+    tryCatch(
+      chisq.test(table(model_df$appalachia, model_df[[var]]))$p.value,
+      error = function(e) NA_real_
+    )
+  )
+
+  tibble(
+    Characteristic = label,
+    Overall = fmt_bin_pct(overall),
+    Non_Appalachia = fmt_bin_pct(non),
+    Appalachia = fmt_bin_pct(app),
+    p_value = fmt_p(pval)
+  )
+}
+
+make_cat_row <- function(label, var, level) {
+
+  overall <- model_df[[var]]
+
+  app <- model_df %>%
+    filter(appalachia == 1) %>%
+    pull(.data[[var]])
+
+  non <- model_df %>%
+    filter(appalachia == 0) %>%
+    pull(.data[[var]])
+  
+ tibble(
+  Characteristic = label,
+  Overall = sprintf(
+  "%s (%.1f%%)",
+  format(sum(overall == level, na.rm = TRUE), big.mark = ","),
+  100 * mean(overall == level, na.rm = TRUE)
+),
+Non_Appalachia = sprintf(
+  "%s (%.1f%%)",
+  format(sum(non == level, na.rm = TRUE), big.mark = ","),
+  100 * mean(non == level, na.rm = TRUE)
+),
+Appalachia = sprintf(
+  "%s (%.1f%%)",
+  format(sum(app == level, na.rm = TRUE), big.mark = ","),
+  100 * mean(app == level, na.rm = TRUE)
+),
+   p_value = ""
+)
+}
+
+# ============================================================
+# Build Table 1
+# ============================================================
+make_group_row <- function(label, var) {
+
+  pval <- suppressWarnings(
+    tryCatch(
+      chisq.test(
+        table(
+          model_df$appalachia,
+          factor(model_df[[var]])
+        )
+      )$p.value,
+      error = function(e) NA_real_
+    )
+  )
+
+  tibble(
+    Characteristic = label,
+    Overall = "",
+    Non_Appalachia = "",
+    Appalachia = "",
+    p_value = fmt_p(pval)
+  )
+}
+table1_pretty <- bind_rows(
+
+  tibble(
+    Characteristic = "Demographic Characteristics",
+    Overall = "",
+    Non_Appalachia = "",
+    Appalachia = "",
+    p_value = ""
+  ),
+
+  make_group_row("Age (Years)", "age_grp"),
+  make_cat_row("   10-14", "age_grp", "10-14"),
+  make_cat_row("   15-17", "age_grp", "15-17"),
+  make_cat_row("   18-24", "age_grp", "18-24"),
+  
+  make_group_row("Sex", "sex_f"),
+  make_cat_row("   Female", "sex_f", "Female"),
+  make_cat_row("   Male", "sex_f", "Male"),
+  
+  make_group_row("Race/Ethnicity", "race_eth_f"),
+  make_cat_row("   Non-Hispanic Asian", "race_eth_f", "Non-Hispanic Asian"),
+make_cat_row("   Non-Hispanic Black", "race_eth_f", "Non-Hispanic Black"),
+  make_cat_row("   Hispanic", "race_eth_f", "Hispanic"),
+make_cat_row("   Non-Hispanic Two or More Races", "race_eth_f", "Non-Hispanic Two or More Races"),
+make_cat_row("   Non-Hispanic White", "race_eth_f", "Non-Hispanic White"),
+make_cat_row("   Other/Unknown", "race_eth_f", "Other/Unknown"),
+
+
+  make_group_row("Suicide Method", "method_cat"),
+  make_cat_row("   Firearm", "method_cat", "Firearm"),
+  make_cat_row("   Hanging/Suffocation", "method_cat", "Hanging/Suffocation"),
+  make_cat_row("   Poisoning", "method_cat", "Poisoning"),
+  make_cat_row("   Other", "method_cat", "Other"),
+
+  tibble(
+    Characteristic = "Mental Health Characteristics",
+    Overall = "",
+    Non_Appalachia = "",
+    Appalachia = "",
+    p_value = ""
+  ),
+
+  make_bin_row("Any Mental Health Diagnosis", "MentalHealthDiagnosis"),
+  make_bin_row("  ADHD", "has_adhd"),
+  make_bin_row("  Anxiety Disorder", "has_anyanxiety"),
+  make_bin_row("  Bipolar Disorder", "has_bipolar"),
+  make_bin_row("  Depression", "has_depression"),
+  make_bin_row("  Other Mental Health Diagnosis", "combinedotherdiagnosis"),
+  make_bin_row("  Schizophrenia/Psychosis", "has_schizo"),
+
+  make_bin_row("Depressed Mood", "DepressedMood_c"),
+  make_bin_row("History of Suicide Attempt", "SuicideAttemptHistory_c"),
+  make_bin_row("History of Suicidal Thoughts", "SuicideThoughtHistory_c"),
+  make_bin_row("Mental Health Treatment", "MentalIllnessTreatment"),
+
+  tibble(
+    Characteristic = "Circumstance Characteristics",
+    Overall = "",
+    Non_Appalachia = "",
+    Appalachia = "",
+    p_value = ""
+  ),
+
+  make_bin_row("Current Crisis", "InCrisis"),
+  make_bin_row("Relationship Problems", "RelationshipProblem"),
+  make_bin_row("Legal Problems", "LegalProblem"),
+
+  tibble(
+    Characteristic = "Community Characteristics",
+    Overall = "",
+    Non_Appalachia = "",
+    Appalachia = "",
+    p_value = ""
+  ),
+
+  make_group_row("Social Vulnerability Index", "svi_quartile_f"),
+  make_cat_row("   Low SVI", "svi_quartile_f", "Low"),
+  make_cat_row("   Low-Moderate SVI", "svi_quartile_f", "Low-Moderate"),
+  make_cat_row("   Moderate-High SVI", "svi_quartile_f", "Moderate-High"),
+  make_cat_row("   High SVI", "svi_quartile_f", "High"),
+  make_group_row("Area of Residence", "metro_f"),
+  make_cat_row("   Metro County", "metro_f", "Metro"),
+  make_cat_row("   Nonmetro County", "metro_f", "Nonmetro")
+)
+
+# ============================================================
+# Flextable formatting
+# ============================================================
+
+ft1 <- flextable(table1_pretty)
+
+section_rows <- which(
+  table1_pretty$Characteristic %in% c(
+    "Demographic Characteristics",
+    "Mental Health Characteristics",
+    "Circumstance Characteristics",
+    "Community Characteristics"
+  )
+)
+
+ft1 <- bold(ft1, i = section_rows, bold = TRUE)
+
+ft1 <- set_header_labels(
+  ft1,
+  Characteristic = "Characteristic",
+  Overall = paste0("Overall (N=", format(n_total, big.mark = ","), ")"),
+  Non_Appalachia = paste0("Non-Appalachia (N=", format(n_non, big.mark = ","), ")"),
+  Appalachia = paste0("Appalachia (N=", format(n_app, big.mark = ","), ")"),
+  p_value = "p-value"
+)
+
+ft1 <- autofit(ft1)
+
+ft1
+
+# ============================================================
+# Export
+# ============================================================
+
+save_as_docx(ft1, path = "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/Table1_Manuscript.docx"
+)
+```
+
+
+```{r}
+# ============================================================
+# Table 2. Primary adjusted logistic regression model
+# Outcome: Appalachian residence (yes/no)
+# County-clustered robust standard errors at county level
+# ============================================================
+
+library(dplyr)
+library(broom)
+library(lmtest)
+library(sandwich)
+library(performance)
+
+# ------------------------------------------------------------
+# Final primary model specification
+# ------------------------------------------------------------
+# This is a more stable specification that keeps the key demographic,
+# clinical, and contextual predictors while reducing the extreme VIFs caused
+# by overly saturated factor coding.
+
+primary_vars <- c(
+  "appalachia",
+  "ResidenceFIPS",
+  "age_grp",
+  "sex_f",
+  "race_eth_f",
+  "year_f",
+  "has_depression",
+  "has_bipolar",
+  "has_adhd",
+  "has_schizo",
+  "has_anyanxiety",
+  "combinedotherdiagnosis",
+  "MentalIllnessTreatment",
+  "DepressedMood_c",
+  "InCrisis",
+  "RelationshipProblem",
+  "SuicideAttemptHistory_c",
+  "SuicideThoughtHistory_c",
+  "LegalProblem",
+  "method_cat",
+  "svi_quartile_f",
+  "metro_f"
+)
+
+primary_df <- model_df %>%
+  filter(if_all(all_of(primary_vars), ~ !is.na(.x)))
+
+m1 <- glm(
+  appalachia ~
+    age_grp +
+    sex_f +
+    race_eth_f +
+    year_f +
+    has_depression +
+    has_bipolar +
+    has_adhd +
+    has_schizo +
+    has_anyanxiety +
+    combinedotherdiagnosis +
+    DepressedMood_c +
+    MentalIllnessTreatment +
+    InCrisis +
+    RelationshipProblem +
+    SuicideAttemptHistory_c +
+    SuicideThoughtHistory_c +
+    LegalProblem +
+    method_cat +
+    svi_quartile_f +
+    metro_f,
+  data = primary_df,
+  family = binomial()
+)
+
+library(dplyr)
+
+# Likelihood ratio test
+anova(m_clinical, m1, test = "Chisq")
+
+vc_m1 <- sandwich::vcovCL(m1, cluster = ~ ResidenceFIPS)
+
+m1_results <- broom::tidy(
+  lmtest::coeftest(m1, vcov. = vc_m1)
+) %>%
+  mutate(
+    OR = exp(estimate),
+    CI_low = exp(estimate - 1.96 * std.error),
+    CI_high = exp(estimate + 1.96 * std.error)
+  )
+
+m1_results
+
+# ------------------------------------------------------------
+# Collinearity diagnostics
+# ------------------------------------------------------------
+
+collinearity_results <- check_collinearity(m1)
+print(collinearity_results)
+
+# ------------------------------------------------------------
+# Manuscript-ready regression table
+# ------------------------------------------------------------
+
+table2_primary <- m1_results %>%
+  filter(term != "(Intercept)") %>%
+  transmute(
+    Variable = term,
+    OR = round(OR, 2),
+    `95% CI` = paste0(
+      "(",
+      round(CI_low, 2),
+      ", ",
+      round(CI_high, 2),
+      ")"
+    ),
+    `p-value` = signif(p.value, 3)
+  )
+
+table2_primary
+
+# ------------------------------------------------------------
+# Export results
+# ------------------------------------------------------------
+
+write.csv(
+  table2_primary,
+  "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/table2_fullvariables_model_OR.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(collinearity_results),
+  "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/table2_primary_model_collinearity.csv",
+  row.names = FALSE
+)
+
+# ------------------------------------------------------------
+# Basic model diagnostics
+# ------------------------------------------------------------
+
+cat("\nModel AIC:", AIC(m1), "\n")
+cat("Observations:", nobs(m1), "\n")
+
+summary(m1)
+table(model_df$appalachia, model_df$svi_quartile_f)
+prop.table(
+  table(model_df$appalachia, model_df$svi_quartile_f),
+  margin = 1
+)
+```
+
+
+## Table 3: Logistic regression — clinical characteristics
+
+```{r table2-clinical}
+library(dplyr)
+library(sandwich)
+library(lmtest)
+library(broom)
+
+# NOTE: `appalachia` is a county-level constant (every record in the same
+# county has the same value), so a county random intercept (glmer with
+# (1 | ResidenceFIPS)) is not identifiable for this outcome — it produces
+# a degenerate fit with astronomical CIs (confirmed earlier in this
+# project). glm() with county-clustered robust SEs is the correct approach
+# for any model where `appalachia` is the outcome.
+
+m_clinical <- glm(
+  appalachia ~ age_grp + sex_f + race_eth_f + year_f +
+    has_depression + has_bipolar + has_adhd + has_schizo + has_anyanxiety +
+    combinedotherdiagnosis +MentalIllnessTreatment + DepressedMood_c +
+    InCrisis + RelationshipProblem + SuicideAttemptHistory_c +
+    SuicideThoughtHistory_c + LegalProblem + method_cat,
+  data = model_df,
+  family = binomial()
+)
+
+vc_clinical <- vcovCL(m_clinical, cluster = ~ ResidenceFIPS)
+
+table3 <- tidy(coeftest(m_clinical, vcov. = vc_clinical)) %>%
+  mutate(
+    OR = exp(estimate),
+    CI_low = exp(estimate - 1.96 * std.error),
+    CI_high = exp(estimate + 1.96 * std.error)
+  ) %>%
+  filter(term != "(Intercept)") %>%
+  transmute(
+    term,
+    OR = round(OR, 2),
+    CI = paste0("(", round(CI_low, 2), ", ", round(CI_high, 2), ")"),
+    p = signif(p.value, 3)
+  )
+
+table3
+
+library(performance)
+check_collinearity(m_clinical)
+
+write.csv(table3, "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/table3_clinical_model.csv", row.names = FALSE)
+```
+
+## Table 4: Logistic regression — contextual/socioeconomic 
+
+```{r}
+
+m_context <- glm(
+  appalachia ~
+    age_grp +
+    sex_f +
+    race_eth_f +
+    year_f +
+    svi_quartile_f +
+    metro_f,
+  data = model_df,
+  family = binomial()
+)
+
+vc_context <- vcovCL(m_context, cluster = ~ ResidenceFIPS)
+
+table4 <- tidy(coeftest(m_context, vcov. = vc_context)) %>%
+  mutate(
+    OR = exp(estimate),
+    CI_low = exp(estimate - 1.96 * std.error),
+    CI_high = exp(estimate + 1.96 * std.error)
+  ) %>%
+  filter(term != "(Intercept)") %>%
+  transmute(
+    term,
+    OR = round(OR, 2),
+    CI = paste0("(", round(CI_low, 2), ", ", round(CI_high, 2), ")"),
+    p = signif(p.value, 3)
+  )
+
+table4
+
+library(performance)
+check_collinearity(m_context)
+
+write.csv(table4, "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/table4_contextual_model.csv", row.names = FALSE)
+```
+
+## Sensitivity check: individual SVI themes (not collapsed to composite)
+
+```{r svi-themes-sensitivity}
+m_themes <- glm(
+  appalachia ~ age_grp + sex_f + race_eth_f + year_f +
+     has_depression + has_bipolar + has_adhd + has_schizo + has_anyanxiety +
+    combinedotherdiagnosis + MentalIllnessTreatment + DepressedMood_c +
+    InCrisis + RelationshipProblem + SuicideAttemptHistory_c +
+    SuicideThoughtHistory_c + LegalProblem +
+    RPL_THEME1_cat + RPL_THEME2_cat + RPL_THEME3_cat + RPL_THEME4_cat +
+    method_cat + metro_f,
+  data = model_df,
+  family = binomial()
+)
+
+vc_theme <- vcovCL(m_themes, cluster = ~ ResidenceFIPS)
+
+out_theme <- tidy(coeftest(m_themes, vcov. = vc_theme)) %>%
+  mutate(
+    OR = exp(estimate),
+    CI_low = exp(estimate - 1.96 * std.error),
+    CI_high = exp(estimate + 1.96 * std.error)
+  )
+
+out_theme
+
+theme_results <- out_theme %>%
+  mutate(
+    OR = round(exp(estimate), 2),
+    LL = round(exp(estimate - 1.96*std.error), 2),
+    UL = round(exp(estimate + 1.96*std.error), 2),
+    p = round(p.value, 4)
+  ) %>%
+  select(term, OR, LL, UL, p)
+
+write.csv(
+  theme_results,"S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/sensitivty_model.csv", row.names = FALSE)
+```
+
+
+```{r}
+#Table 6 Primary adjusted logistic regression model w/ SVI Themes
+#Just using the original primary model coding, but replacing the variables
+
+library(dplyr)
+library(broom)
+library(lmtest)
+library(sandwich)
+library(performance)
+
+
+primary_vars <- c(
+  "appalachia",
+  "ResidenceFIPS",
+  "age_grp",
+  "sex_f",
+  "race_eth_f",
+  "year_f",
+  "has_depression",
+  "has_bipolar",
+  "has_adhd",
+  "has_schizo",
+  "has_anyanxiety",
+  "combinedotherdiagnosis",
+  "MentalIllnessTreatment",
+  "DepressedMood_c",
+  "InCrisis",
+  "RelationshipProblem",
+  "SuicideAttemptHistory_c",
+  "SuicideThoughtHistory_c",
+  "LegalProblem",
+  "method_cat",
+  "RPL_THEME1_cat",
+  "RPL_THEME2_cat",
+  "RPL_THEME3_cat",
+  "RPL_THEME4_cat",
+  "metro_f"
+)
+
+primary_df <- model_df %>%
+  filter(if_all(all_of(primary_vars), ~ !is.na(.x)))
+
+m_svi_theme <- glm(
+  appalachia ~
+    age_grp +
+    sex_f +
+    race_eth_f +
+    year_f +
+    has_depression +
+    has_bipolar +
+    has_adhd +
+    has_schizo +
+    has_anyanxiety +
+    combinedotherdiagnosis +
+    DepressedMood_c +
+    MentalIllnessTreatment +
+    InCrisis +
+    RelationshipProblem +
+    SuicideAttemptHistory_c +
+    SuicideThoughtHistory_c +
+    LegalProblem +
+    method_cat +
+    RPL_THEME1_cat +
+    RPL_THEME2_cat +
+    RPL_THEME3_cat +
+    RPL_THEME4_cat +
+    metro_f, 
+  data = primary_df,
+  family = binomial()
+)
+
+library(dplyr)
+
+# Likelihood ratio test
+anova(m_clinical, m_svi_theme, test = "Chisq")
+
+vc_m_svi_theme <- sandwich::vcovCL(m_svi_theme, cluster = ~ ResidenceFIPS)
+
+m_svi_theme_results <- broom::tidy(
+  lmtest::coeftest(m_svi_theme, vcov. = vc_m_svi_theme)
+) %>%
+  mutate(
+    OR = exp(estimate),
+    CI_low = exp(estimate - 1.96 * std.error),
+    CI_high = exp(estimate + 1.96 * std.error)
+  )
+
+m_svi_theme_results
+
+# Collinearity diagnostics
+collinearity_results <- check_collinearity(m_svi_theme)
+print(collinearity_results)
+
+
+# Manuscript-ready regression table
+
+table6_primary <- m_svi_theme_results %>%
+  filter(term != "(Intercept)") %>%
+  transmute(
+    Variable = term,
+    OR = round(OR, 2),
+    `95% CI` = paste0(
+      "(",
+      round(CI_low, 2),
+      ", ",
+      round(CI_high, 2),
+      ")"
+    ),
+    `p-value` = signif(p.value, 3)
+  )
+
+table6_primary
+
+# Export results
+write.csv(
+  table6_primary,
+  "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/table6_fullvariableswithsvithemes_model_OR.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(collinearity_results),
+  "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/table6_primary_model_dsvi_themes_collinearity.csv",
+  row.names = FALSE
+)
+
+# Basic model diagnostics
+cat("\nModel AIC:", AIC(m_svi_theme), "\n")
+cat("Observations:", nobs(m_svi_theme), "\n")
+
+summary(m_svi_theme)
+
+table(model_df$appalachia, model_df$RPL_THEME1_cat)
+prop.table(
+  table(model_df$appalachia, model_df$RPL_THEME1_cat),
+  margin = 1
+)
+
+table(model_df$appalachia, model_df$RPL_THEME2_cat)
+prop.table(
+  table(model_df$appalachia, model_df$RPL_THEME2_cat),
+  margin = 1
+)
+
+table(model_df$appalachia, model_df$RPL_THEME3_cat)
+prop.table(
+  table(model_df$appalachia, model_df$RPL_THEME3_cat),
+  margin = 1
+)
+
+table(model_df$appalachia, model_df$RPL_THEME4_cat)
+prop.table(
+  table(model_df$appalachia, model_df$RPL_THEME4_cat),
+  margin = 1
+)
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+library(flextable)
+library(officer)
+
+#Supplemental Table 1. Descriptive Table for SVI Themes
+
+library(dplyr)
+library(tibble)
+library(flextable)
+library(officer)
+
+# Sample counts
+n_app <- sum(model_df$appalachia == 1, na.rm = TRUE)
+n_non <- sum(model_df$appalachia == 0, na.rm = TRUE)
+n_total <- nrow(model_df)
+
+# Helper functions
+fmt_p <- function(p) {
+  if (is.na(p)) return("")
+  if (p < .001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+make_cat_row <- function(label, var, level) {
+
+  overall <- model_df[[var]]
+
+  app <- model_df %>%
+    filter(appalachia == 1) %>%
+    pull(.data[[var]])
+
+  non <- model_df %>%
+    filter(appalachia == 0) %>%
+    pull(.data[[var]])
+
+  tibble(
+    Characteristic = label,
+    Overall = sprintf(
+      "%s (%.1f%%)",
+      format(sum(overall == level, na.rm = TRUE), big.mark = ","),
+      100 * mean(overall == level, na.rm = TRUE)
+    ),
+    Non_Appalachia = sprintf(
+      "%s (%.1f%%)",
+      format(sum(non == level, na.rm = TRUE), big.mark = ","),
+      100 * mean(non == level, na.rm = TRUE)
+    ),
+    Appalachia = sprintf(
+      "%s (%.1f%%)",
+      format(sum(app == level, na.rm = TRUE), big.mark = ","),
+      100 * mean(app == level, na.rm = TRUE)
+    ),
+    p_value = ""
+  )
+}
+
+make_group_row <- function(label, var) {
+
+  pval <- suppressWarnings(
+    tryCatch(
+      chisq.test(
+        table(
+          model_df$appalachia,
+          factor(model_df[[var]])
+        )
+      )$p.value,
+      error = function(e) NA_real_
+    )
+  )
+
+  tibble(
+    Characteristic = label,
+    Overall = "",
+    Non_Appalachia = "",
+    Appalachia = "",
+    p_value = fmt_p(pval)
+  )
+}
+
+# Supplemental Table
+supp_table <- bind_rows(
+
+  make_group_row(
+    "Theme 1: Socioeconomic Status",
+    "RPL_THEME1_cat"
+  ),
+  make_cat_row("   Low", "RPL_THEME1_cat", "Low"),
+  make_cat_row("   Low-Moderate", "RPL_THEME1_cat", "Low-Moderate"),
+  make_cat_row("   Moderate-High", "RPL_THEME1_cat", "Moderate-High"),
+  make_cat_row("   High", "RPL_THEME1_cat", "High"),
+
+  make_group_row(
+    "Theme 2: Household Characteristics",
+    "RPL_THEME2_cat"
+  ),
+  make_cat_row("   Low", "RPL_THEME2_cat", "Low"),
+  make_cat_row("   Low-Moderate", "RPL_THEME2_cat", "Low-Moderate"),
+  make_cat_row("   Moderate-High", "RPL_THEME2_cat", "Moderate-High"),
+  make_cat_row("   High", "RPL_THEME2_cat", "High"),
+
+  make_group_row(
+    "Theme 3: Minority Status & Language",
+    "RPL_THEME3_cat"
+  ),
+  make_cat_row("   Low", "RPL_THEME3_cat", "Low"),
+  make_cat_row("   Low-Moderate", "RPL_THEME3_cat", "Low-Moderate"),
+  make_cat_row("   Moderate-High", "RPL_THEME3_cat", "Moderate-High"),
+  make_cat_row("   High", "RPL_THEME3_cat", "High"),
+
+  make_group_row(
+    "Theme 4: Housing Type & Transportation",
+    "RPL_THEME4_cat"
+  ),
+  make_cat_row("   Low", "RPL_THEME4_cat", "Low"),
+  make_cat_row("   Low-Moderate", "RPL_THEME4_cat", "Low-Moderate"),
+  make_cat_row("   Moderate-High", "RPL_THEME4_cat", "Moderate-High"),
+  make_cat_row("   High", "RPL_THEME4_cat", "High")
+)
+
+# Flextable formatting
+ft_supp <- flextable(supp_table)
+
+ft_supp <- set_header_labels(
+  ft_supp,
+  Characteristic = "Characteristic",
+  Overall = paste0("Overall (N=", format(n_total, big.mark = ","), ")"),
+  Non_Appalachia = paste0("Non-Appalachia (N=", format(n_non, big.mark = ","), ")"),
+  Appalachia = paste0("Appalachia (N=", format(n_app, big.mark = ","), ")"),
+  p_value = "p-value"
+)
+
+ft_supp <- bold(
+  ft_supp,
+  i = c(1, 6, 11, 16),
+  bold = TRUE
+)
+
+ft_supp <- autofit(ft_supp)
+
+ft_supp
+
+# Export
+save_as_docx(
+  ft_supp,
+  path = "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/Supplemental_Table_SVI_Themes.docx"
+)
+```
+
+
+## Additional analyses
+
+
+```{r mh-diagnosis-appalachia-only}
+library(lme4)
+library(broom.mixed)
+#mental health diagnosis within app
+# MentalHealthDiagnosis varies within county, so a county random intercept
+
+app_only <- model_df %>% filter(appalachia == 1)
+
+m_mh_appalachia_only <- glmer(
+  MentalHealthDiagnosis ~
+    age_grp +
+    sex_f +
+    race_eth_f +
+    year_f +
+    InCrisis +
+    RelationshipProblem +
+    SuicideAttemptHistory_c +
+    SuicideThoughtHistory_c +
+    LegalProblem +
+    method_cat +
+    svi_quartile_f +
+    metro_f +
+    (1 | ResidenceState/ResidenceFIPS),
+  data = app_only,
+  family = binomial(),
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+summary(m_mh_appalachia_only)
+
+app_d <- broom.mixed::tidy(m_mh_appalachia_only, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = exp(estimate),
+    CI_low = exp(conf.low),
+    CI_high = exp(conf.high)
+  ) %>%
+  select(term, OR, CI_low, CI_high, p.value)
+
+app_d
+write.csv(app_d, "outputs_main/table5_supplementarydiagnosisappalachia_model.csv", row.names = FALSE)
+```
+
+```{r mh-svi-state-county-ri}
+m_state_county_ri <- glmer(
+  MentalHealthDiagnosis ~ appalachia + age_grp + sex_f + race_eth_f + year_f + RPL_THEME1 + RPL_THEME2 + RPL_THEME3 + RPL_THEME4 +
+    (1 | ResidenceState/ResidenceFIPS),
+  data = model_df,
+  family = binomial(),
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+#For specific diagnoses
+#m_depression <- glmer(
+ # has_depression ~ appalachia + age_grp + sex_f + race_f +
+   # eth_f + year_f +
+   # RPL_THEME1 + RPL_THEME2 + RPL_THEME3 + RPL_THEME4 +
+  #  (1 | ResidenceState/ResidenceFIPS),
+  #data = model_df,
+ # family = binomial(),
+  #control = glmerControl(optimizer = "bobyqa")
+#)
+
+#m_anxiety <- glmer(
+  #has_anyanxiety ~ appalachia + age_grp + sex_f + race_f +
+   # eth_f + year_f +
+   # RPL_THEME1 + RPL_THEME2 + RPL_THEME3 + RPL_THEME4 +
+   # (1 | ResidenceState/ResidenceFIPS),
+  #data = model_df,
+  #family = binomial()
+#)
+
+#m_bipolar <- glmer(
+ # has_bipolar ~ appalachia + age_grp + sex_f + race_f +
+    #eth_f + year_f +
+    #RPL_THEME1 + RPL_THEME2 + RPL_THEME3 + RPL_THEME4 +
+    #(1 | ResidenceState/ResidenceFIPS),
+ # data = model_df,
+  #family = binomial()
+#)
+
+# ADHD
+#m_adhd <- glmer(
+ # has_adhd ~ appalachia + age_grp + sex_f + race_f +
+   # eth_f + year_f +
+   # RPL_THEME1 + RPL_THEME2 + RPL_THEME3 + RPL_THEME4 +
+    #(1 | ResidenceState/ResidenceFIPS),
+ # data = model_df,
+  #family = binomial(),
+  #control = glmerControl(optimizer = "bobyqa")
+#)
+
+# Schizophrenia
+#m_schizo <- glmer(
+ # has_schizo ~ appalachia + age_grp + sex_f + race_f +
+   # eth_f + year_f +
+   # RPL_THEME1 + RPL_THEME2 + RPL_THEME3 + RPL_THEME4 +
+   # (1 | ResidenceState/ResidenceFIPS),
+  #data = model_df,
+  #family = binomial(),
+ # control = glmerControl(optimizer = "bobyqa")
+#)
+
+# Other diagnosis
+#m_otherdiag <- glmer(
+  #combinedotherdiagnosis ~ appalachia + age_grp + sex_f + race_f +
+  #  eth_f + year_f +
+  #  RPL_THEME1 + RPL_THEME2 + RPL_THEME3 + RPL_THEME4 +
+  #  (1 | ResidenceState/ResidenceFIPS),
+  #data = model_df,
+ # family = binomial(),
+  #control = glmerControl(optimizer = "bobyqa")
+#)
+
+mh_table <- broom.mixed::tidy(m_state_county_ri, effects = "fixed", conf.int = TRUE) %>%
+  mutate(
+    OR = exp(estimate),
+    CI_low = exp(conf.low),
+    CI_high = exp(conf.high)
+  ) %>%
+  select(term, OR, CI_low, CI_high, p.value)
+
+mh_table
+```
+
+```{r method-by-svi-theme}
+# Suicide method category modeled against SVI themes, with state/county
+# nested random intercepts (method varies within county, so this is valid).
+df_m <- model_df %>%
+  filter(!is.na(method_cat)) %>%
+  mutate(
+    ResidenceState = factor(ResidenceState),
+    ResidenceFIPS  = factor(ResidenceFIPS),
+    firearm_yes    = if_else(method_cat == "Firearm", 1L, 0L),
+    hanging_yes    = if_else(method_cat == "Hanging/Suffocation", 1L, 0L),
+    poisoning_yes  = if_else(method_cat == "Poisoning", 1L, 0L)
+  )
+
+fit_method <- function(outcome) {
+  f <- as.formula(
+    paste0(outcome, " ~ appalachia + age_grp + sex_f + race_f + eth_f + year_f + ",
+           "RPL_THEME1 + RPL_THEME2 + RPL_THEME3 + RPL_THEME4 + ",
+           "(1 | ResidenceState/ResidenceFIPS)")
+  )
+  glmer(f, data = df_m, family = binomial(), control = glmerControl(optimizer = "bobyqa"))
+}
+
+m_firearm   <- fit_method("firearm_yes")
+m_hanging   <- fit_method("hanging_yes")
+m_poisoning <- fit_method("poisoning_yes")
+
+extract_or <- function(m, label) {
+  broom.mixed::tidy(m, effects = "fixed", conf.int = TRUE) %>%
+    mutate(model = label, OR = exp(estimate), CI_low = exp(conf.low), CI_high = exp(conf.high)) %>%
+    select(model, term, OR, CI_low, CI_high, p.value)
+}
+
+method_results <- bind_rows(
+  extract_or(m_firearm, "Firearm vs all others"),
+  extract_or(m_hanging, "Hanging/Suffocation vs all others"),
+  extract_or(m_poisoning, "Poisoning vs all others")
+)
+
+method_results
+```
+
+
+```{r}
+# Forest Plot for ATRN Poster
+
+library(ggplot2)
+
+# Set up data
+forest_df <- data.frame(
+  Group = c(
+    "Contextual",
+    "Contextual",
+    "Contextual",
+    "Method",
+    "Method",
+    "Clinical",
+    "Clinical",
+    "Clinical"
+  ),
+  Variable = c(
+    "Moderate-High SVI",
+    "Low-Moderate SVI",
+    "Non-metro County",
+    "Firearm",
+    "Hanging/Suffocation",
+    "Depressed Mood",
+    "Anxiety Disorder",
+    "History of Suicidal Thoughts"
+  ),
+  OR = c(2.71, 2.36, 2.21, 2.01, 1.67, 0.73, 0.70, 0.69),
+  LL = c(1.41, 1.15, 1.53, 1.40, 1.23, 0.62, 0.55, 0.59),
+  UL = c(5.12, 4.84, 3.12, 2.87, 2.29, 0.85, 0.89, 0.80)
+)
+
+# Order variables for plotting
+forest_df$Variable <- factor(
+  forest_df$Variable,
+  levels = rev(forest_df$Variable)
+)
+
+# Create forest plot
+forest_plot <- ggplot(forest_df, aes(x = OR, y = Variable)) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "gray50"
+  ) +
+  geom_errorbarh(
+    aes(xmin = LL, xmax = UL),
+    height = 0.2,
+    color = "steelblue"
+  ) +
+  geom_point(
+    size = 4,
+    color = "steelblue"
+  ) +
+  geom_text(
+    aes(label = sprintf("%.2f", OR)),
+    hjust = -0.3,
+    size = 4
+  ) +
+  facet_grid(
+    Group ~ .,
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  labs(
+    x = "Adjusted Odds Ratio (95% CI)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold"),
+    strip.text.y = element_text(
+      face = "bold",
+      size = 12
+    )
+  )
+
+# Display plot
+forest_plot
+
+ggsave(
+  filename = "S:/RESCSPR_NVDRS/RISE Appalachia/outputs_main/forest_plot.png",
+  plot = forest_plot,
+  width = 10,
+  height = 7,
+  dpi = 600
+)
+```
+
+
+
