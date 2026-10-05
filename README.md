@@ -3,9 +3,9 @@
 This repository contains supplementary materials for the ATRN 2026 conference poster.
  
 ## Materials
-- References PDF
+- References PDF (ATRN References 2026.docx)
 - Poster PDF
-- Tables/Figures
+- Tables/Figures 
 - Analysis code
  
 ## Authors
